@@ -23,6 +23,19 @@
 #import "SVGQuartzRenderer.h"
 #import "NSData+Base64.h"
 
+@implementation SVGPoint
+@synthesize x;
+@synthesize y;
+
+- (id)initWithX:(float)out_x y:(float)out_y
+{
+	self = [super init];
+	self.x = out_x;
+	self.y = out_y;
+	return self;
+}
+@end
+
 @interface SVGQuartzRenderer (hidden)
 
 	- (void)setStyleContext:(NSString *)style;
@@ -32,20 +45,18 @@
 	- (void) cleanupAfterFinishedParsing;
 
 	void CGPathAddRoundRect(CGMutablePathRef path, CGRect rect, float radius);
+	void CGPathAddPolygon(CGMutablePathRef path,NSMutableArray *polygonPoints);
+	void CGPathAddCircle(CGMutablePathRef path,SVGPoint *center,float r);
 	void drawImagePattern(void *fillPatDescriptor, CGContextRef context);
 	CGImageRef imageFromBase64(NSString *b64Data);
-
-	-(BOOL) doLocate:(CGPoint)location withBoundingBox:(CGSize)box;
-
 
 @end
 
 @implementation SVGQuartzRenderer
 
-@synthesize viewFrame;
 @synthesize documentSize;
 @synthesize delegate;
-@synthesize scaleX, scaleY, offsetX, offsetY,rotation;
+@synthesize scale;
 
 struct FillPatternDescriptor {
 	CGImageRef imgRef;
@@ -56,14 +67,9 @@ typedef void (*CGPatternDrawPatternCallback) (void * info,
 											  CGContextRef context);
 
 NSXMLParser* xmlParser;
-NSData *svgXml;
+NSString *svgFileName;
 CGAffineTransform transform;
 CGContextRef cgContext=NULL;
-float initialScaleX = 1;
-float initialScaleY = 1;
-float width=0;
-float height=0;
-BOOL firstRender = YES;
 NSMutableDictionary *defDict;
 FillPatternDescriptor desc;
 
@@ -76,7 +82,8 @@ NSDictionary *curFlowRegion;
 
 BOOL inDefSection = NO;
 
-
+CGAffineTransform gTransform;
+BOOL pathTrnsfrmReset = YES;
 
 // Variables for storing style data
 // -------------------------------------------------------------------------
@@ -85,7 +92,7 @@ BOOL inDefSection = NO;
 // Also, the style object could be responsible for parsing CSS and for configuring
 // the CGContext according to it's style.
 BOOL doFill;
-CGFloat fillColor[4];
+float fillColor[4];
 float fillOpacity;
 BOOL doStroke = NO;
 unsigned int strokeColor = 0;
@@ -94,9 +101,9 @@ float strokeOpacity;
 CGLineJoin lineJoinStyle;
 CGLineCap lineCapStyle;
 float miterLimit;
-CGPatternRef fillPattern=NULL;
+CGPatternRef fillPattern;
 NSString *fillType;
-CGGradientRef fillGradient=NULL;
+CGGradientRef fillGradient;
 CGPoint fillGradientPoints[2];
 int fillGradientAngle;
 CGPoint fillGradientCenterPoint;
@@ -112,12 +119,7 @@ float fontSize;
 
 		defDict = [[NSMutableDictionary alloc] init];
 		
-		scaleX = 1.0;
-		scaleY = 1.0;
-		offsetX = 0;
-		offsetY = 0;
-		rotation = 0;
-		documentSize = CGSizeMake(0,0);
+		scale = 1.0;
     }
     return self;
 }
@@ -136,8 +138,8 @@ float fontSize;
 	fillColor[3]=1;
 	doStroke = NO;
 	strokeColor = 0;
-	strokeWidth = 1.0;
-	strokeOpacity = 1.0;
+	strokeWidth = 1.0 * scale;
+	strokeOpacity = 1.0 * scale;
 	lineJoinStyle = kCGLineJoinMiter;
 	lineCapStyle = kCGLineCapButt;
 	miterLimit = 4;
@@ -148,61 +150,15 @@ float fontSize;
 
 - (void)drawSVGFile:(NSString *)file
 {
-	if (svgXml == nil)
-	    svgXml = [NSData dataWithContentsOfFile:file];
-	xmlParser = [xmlParser initWithData:svgXml];
+	svgFileName = [file retain];
+	NSData *xml = [NSData dataWithContentsOfFile:file];
+	xmlParser = [xmlParser initWithData:xml];
 	
 	[xmlParser setDelegate:self];
 	[xmlParser setShouldResolveExternalEntities:NO];
 	[xmlParser parse];
 }
 
-- (void) resetScale
-{
-	scaleX = initialScaleX;
-	scaleY = initialScaleY;
-	
-	
-	[self doLocate:CGPointMake(0.5,0.5) withBoundingBox:CGSizeMake(1,1)];
-
-	
-}
-
--(CGPoint) relativeImagePointFrom:(CGPoint)viewPoint
-{
-    float x = (offsetX + viewPoint.x)/(scaleX*width);
-	float y = (offsetY + viewPoint.y)/(scaleY*height);
-	return CGPointMake(x,y);
-}
-
--(BOOL) doLocate:(CGPoint)location withBoundingBox:(CGSize)box
-{
-	//reject locations outside of the image
-	if (location.x <0 || location.y < 0 || location.x > 1 || location.y > 1)
-		return NO;
-	
-	//reject bounding box that is not wholly contained in image
-	if (box.width <0 || box.height < 0 || box.width > 1 || box.height > 1)
-		return NO;
-	
-	scaleX = initialScaleX/box.width;
-	scaleY = initialScaleY/box.height;
-	
-	//reverse calculation from relativeImagePointFrom above, with viewPoint set to middle of screen
-	offsetX = -viewFrame.size.width/2 +  location.x* scaleX* width;
-	offsetY = -viewFrame.size.height/2 + location.y * scaleY* height;
-	
-	
-	return YES;
-}
-
-
--(void) locate:(CGPoint)location withBoundingBox:(CGSize)box
-{
-
-	if ([self doLocate:location withBoundingBox:box])
-	     [self drawSVGFile:nil];
-}
 
 // Element began
 // -----------------------------------------------------------------------------
@@ -217,156 +173,132 @@ didStartElement:(NSString *)elementName
 	// Top level SVG node
 	// -------------------------------------------------------------------------
 	if([elementName isEqualToString:@"svg"]) {
-
-		if (firstRender)
-		{
-			width = [[attrDict valueForKey:@"width"] floatValue];
-			height = [[attrDict valueForKey:@"height"] floatValue];
-			documentSize = viewFrame.size;	
-			
-			float sx = viewFrame.size.width/width;
-			float sy = viewFrame.size.height/height;
-			
-			float scale =  fmax(sx,sy);
-			initialScaleX =scale;
-			initialScaleY = scale;
-			scaleX = initialScaleX;
-			scaleY = initialScaleY;
-			
-			[self doLocate:CGPointMake(0.5,0.5) withBoundingBox:CGSizeMake(1,1)];
-		
-			firstRender = NO;
-		} 
+		documentSize = CGSizeMake([[attrDict valueForKey:@"width"] floatValue] * scale,
+							   [[attrDict valueForKey:@"height"] floatValue] * scale);
 		
 		doStroke = NO;
 		
 		if(delegate) {
-			
+		    if (cgContext != nil) 
+				CGContextRelease(cgContext);
 			cgContext = [delegate svgRenderer:self requestedCGContextWithSize:documentSize];
 		}
-		
-		//default transformation
-	    transform = CGAffineTransformScale(CGAffineTransformIdentity, scaleX, scaleY);	
-		if (rotation != 0)
-			transform = CGAffineTransformRotate(transform, rotation);	
-		transform = CGAffineTransformTranslate(transform, -offsetX/scaleX, -offsetY/scaleY);
-	    CGContextConcatCTM(cgContext,transform);
-	
-
+		gTransform = CGAffineTransformIdentity;
+		transform = CGAffineTransformIdentity;
 	}
 	
 	// Definitions
 	// -------------------------------------------------------------------------
-	else if([elementName isEqualToString:@"defs"]) {
+	if([elementName isEqualToString:@"defs"]) {
 		defDict = [[NSMutableDictionary alloc] init];
 		inDefSection = YES;
 	}
 	
-	else if([elementName isEqualToString:@"pattern"]) {
-		[curPat release];
-		curPat = [[NSMutableDictionary alloc] init];
+		if([elementName isEqualToString:@"pattern"]) {
+			[curPat release];
+			curPat = [[NSMutableDictionary alloc] init];
+			
+			NSEnumerator *enumerator = [attrDict keyEnumerator];
+			id key;
+			while ((key = [enumerator nextObject])) {
+				NSDictionary *obj = [attrDict objectForKey:key];
+				[curPat setObject:obj forKey:key];
+			}
+			NSMutableArray* imagesArray = [NSMutableArray new];
+			[curPat setObject:imagesArray forKey:@"images"];
+			[imagesArray release];
+			[curPat setObject:@"pattern" forKey:@"type"];
+		}
+			if([elementName isEqualToString:@"image"]) {
+				NSMutableDictionary *imageDict = [[NSMutableDictionary alloc] init];
+				NSEnumerator *enumerator = [attrDict keyEnumerator];
+				id key;
+				while ((key = [enumerator nextObject])) {
+					NSDictionary *obj = [attrDict objectForKey:key];
+					[imageDict setObject:obj forKey:key];
+				}
+				[[curPat objectForKey:@"images"] addObject:imageDict];
+				[imageDict release];
+			}
 		
-		NSEnumerator *enumerator = [attrDict keyEnumerator];
-		id key;
-		while ((key = [enumerator nextObject])) {
-			NSDictionary *obj = [attrDict objectForKey:key];
-			[curPat setObject:obj forKey:key];
+		if([elementName isEqualToString:@"linearGradient"]) {
+			[curGradient release];
+			curGradient = [[NSMutableDictionary alloc] init];
+			NSEnumerator *enumerator = [attrDict keyEnumerator];
+			id key;
+			while ((key = [enumerator nextObject])) {
+				NSDictionary *obj = [attrDict objectForKey:key];
+				[curGradient setObject:obj forKey:key];
+			}
+			[curGradient setObject:@"linearGradient" forKey:@"type"];
+			NSMutableArray* stopsArray = [NSMutableArray new];
+			[curGradient setObject:stopsArray forKey:@"stops"];
+			[stopsArray release];
 		}
-		NSMutableArray* imagesArray = [NSMutableArray new];
-		[curPat setObject:imagesArray forKey:@"images"];
-		[imagesArray release];
-		[curPat setObject:@"pattern" forKey:@"type"];
-	}
-	else if([elementName isEqualToString:@"image"]) {
-		NSMutableDictionary *imageDict = [[NSMutableDictionary alloc] init];
-		NSEnumerator *enumerator = [attrDict keyEnumerator];
-		id key;
-		while ((key = [enumerator nextObject])) {
-			NSDictionary *obj = [attrDict objectForKey:key];
-			[imageDict setObject:obj forKey:key];
+			if([elementName isEqualToString:@"stop"]) {
+				NSMutableDictionary *stopDict = [[NSMutableDictionary alloc] init];
+				NSEnumerator *enumerator = [attrDict keyEnumerator];
+				id key;
+				while ((key = [enumerator nextObject])) {
+					NSDictionary *obj = [attrDict objectForKey:key];
+					[stopDict setObject:obj forKey:key];
+				}
+				[[curGradient objectForKey:@"stops"] addObject:stopDict];
+				[stopDict release];
+			}
+		
+		if([elementName isEqualToString:@"radialGradient"]) {
+			[curGradient release];
+			curGradient = [[NSMutableDictionary alloc] init];
+			NSEnumerator *enumerator = [attrDict keyEnumerator];
+			id key;
+			while ((key = [enumerator nextObject])) {
+				NSDictionary *obj = [attrDict objectForKey:key];
+				[curGradient setObject:obj forKey:key];
+			}
+			[curGradient setObject:@"radialGradient" forKey:@"type"];
 		}
-		[[curPat objectForKey:@"images"] addObject:imageDict];
-		[imageDict release];
-	}
 	
-	else if([elementName isEqualToString:@"linearGradient"]) {
-		[curGradient release];
-		curGradient = [[NSMutableDictionary alloc] init];
-		NSEnumerator *enumerator = [attrDict keyEnumerator];
-		id key;
-		while ((key = [enumerator nextObject])) {
-			NSDictionary *obj = [attrDict objectForKey:key];
-			[curGradient setObject:obj forKey:key];
+		if([elementName isEqualToString:@"filter"]) {
+			[curFilter release];
+			curFilter = [[NSMutableDictionary alloc] init];
+			NSEnumerator *enumerator = [attrDict keyEnumerator];
+			id key;
+			while ((key = [enumerator nextObject])) {
+				NSDictionary *obj = [attrDict objectForKey:key];
+				[curFilter setObject:obj forKey:key];
+			}
+			NSMutableArray* gaussianBlursArray = [NSMutableArray new];
+			[curFilter setObject:gaussianBlursArray forKey:@"feGaussianBlurs"];
+			[gaussianBlursArray release];
 		}
-		[curGradient setObject:@"linearGradient" forKey:@"type"];
-		NSMutableArray* stopsArray = [NSMutableArray new];
-		[curGradient setObject:stopsArray forKey:@"stops"];
-		[stopsArray release];
-	}
-	else if([elementName isEqualToString:@"stop"]) {
-		NSMutableDictionary *stopDict = [[NSMutableDictionary alloc] init];
-		NSEnumerator *enumerator = [attrDict keyEnumerator];
-		id key;
-		while ((key = [enumerator nextObject])) {
-			NSDictionary *obj = [attrDict objectForKey:key];
-			[stopDict setObject:obj forKey:key];
-		}
-		[[curGradient objectForKey:@"stops"] addObject:stopDict];
-		[stopDict release];
-	}
-	
-	else if([elementName isEqualToString:@"radialGradient"]) {
-		[curGradient release];
-		curGradient = [[NSMutableDictionary alloc] init];
-		NSEnumerator *enumerator = [attrDict keyEnumerator];
-		id key;
-		while ((key = [enumerator nextObject])) {
-			NSDictionary *obj = [attrDict objectForKey:key];
-			[curGradient setObject:obj forKey:key];
-		}
-		[curGradient setObject:@"radialGradient" forKey:@"type"];
-	}
-	
-	else if([elementName isEqualToString:@"filter"]) {
-		[curFilter release];
-		curFilter = [[NSMutableDictionary alloc] init];
-		NSEnumerator *enumerator = [attrDict keyEnumerator];
-		id key;
-		while ((key = [enumerator nextObject])) {
-			NSDictionary *obj = [attrDict objectForKey:key];
-			[curFilter setObject:obj forKey:key];
-		}
-		NSMutableArray* gaussianBlursArray = [NSMutableArray new];
-		[curFilter setObject:gaussianBlursArray forKey:@"feGaussianBlurs"];
-		[gaussianBlursArray release];
-	}
-	else if([elementName isEqualToString:@"feGaussianBlur"]) {
-		NSMutableDictionary *blurDict = [[NSMutableDictionary alloc] init];
-		NSEnumerator *enumerator = [attrDict keyEnumerator];
-		id key;
-		while ((key = [enumerator nextObject])) {
-			NSDictionary *obj = [attrDict objectForKey:key];
-			[blurDict setObject:obj forKey:key];
-		}
-		[[curFilter objectForKey:@"feGaussianBlurs"] addObject:blurDict];
-		[blurDict release];
-	}
-	else if([elementName isEqualToString:@"feColorMatrix"]) {
-		
-	}
-	else if([elementName isEqualToString:@"feFlood"]) {
-		
-	}
-	else if([elementName isEqualToString:@"feBlend"]) {
-		
-	}
-	else if([elementName isEqualToString:@"feComposite"]) {
-		
-	}
+			if([elementName isEqualToString:@"feGaussianBlur"]) {
+				NSMutableDictionary *blurDict = [[NSMutableDictionary alloc] init];
+				NSEnumerator *enumerator = [attrDict keyEnumerator];
+				id key;
+				while ((key = [enumerator nextObject])) {
+					NSDictionary *obj = [attrDict objectForKey:key];
+					[blurDict setObject:obj forKey:key];
+				}
+				[[curFilter objectForKey:@"feGaussianBlurs"] addObject:blurDict];
+				[blurDict release];
+			}
+			if([elementName isEqualToString:@"feColorMatrix"]) {
+				
+			}
+			if([elementName isEqualToString:@"feFlood"]) {
+				
+			}
+			if([elementName isEqualToString:@"feBlend"]) {
+				
+			}
+			if([elementName isEqualToString:@"feComposite"]) {
+				
+			}
 	
 	// Group node
 	// -------------------------------------------------------------------------
-	else if([elementName isEqualToString:@"g"]) {
+	if([elementName isEqualToString:@"g"]) {
 		[curLayer release];
 		curLayer = [[NSMutableDictionary alloc] init];
 		NSEnumerator *enumerator = [attrDict keyEnumerator];
@@ -382,16 +314,18 @@ didStartElement:(NSString *)elementName
 		
 		if([attrDict valueForKey:@"style"])
 			[self setStyleContext:[attrDict valueForKey:@"style"]];
-
+		
 		if([attrDict valueForKey:@"transform"]) {
+			gTransform = CGAffineTransformIdentity;
 			[self applyTransformations:[attrDict valueForKey:@"transform"]];
+			gTransform = transform;
 		}
 	}
 	
 	
 	// Path node
 	// -------------------------------------------------------------------------
-	else if([elementName isEqualToString:@"path"]) {
+	if([elementName isEqualToString:@"path"]) {
 		
 		// For now, we'll ignore paths in definitions
 		if(inDefSection)
@@ -624,21 +558,21 @@ didStartElement:(NSString *)elementName
 					// Not yet implemented commands
 					//-----------------------------------------
 					if([currentCommand isEqualToString:@"q"]
-					   || [currentCommand isEqualToString:@"Q"]
-					   || [currentCommand isEqualToString:@"t"]
-					   || [currentCommand isEqualToString:@"T"]) {
+					|| [currentCommand isEqualToString:@"Q"]
+					|| [currentCommand isEqualToString:@"t"]
+					|| [currentCommand isEqualToString:@"T"]) {
 						prm_i++;
 					}
 					
 					// Set initial point
 					if(firstVertex) {
 						firstPoint = curPoint;
-						CGPathMoveToPoint(path, NULL, firstPoint.x, firstPoint.y);
+						CGPathMoveToPoint(path, NULL, firstPoint.x * scale, firstPoint.y * scale);
 					}
 					
 					// Close path
 					if([currentCommand isEqualToString:@"z"] || [currentCommand isEqualToString:@"Z"]) {
-						CGPathAddLineToPoint(path, NULL, firstPoint.x, firstPoint.y);
+						CGPathAddLineToPoint(path, NULL, firstPoint.x * scale, firstPoint.y * scale);
 						CGPathCloseSubpath(path);
 						curPoint = CGPointMake(-1, -1);
 						firstPoint = CGPointMake(-1, -1);
@@ -649,16 +583,16 @@ didStartElement:(NSString *)elementName
 					if(curCmdType) {
 						if([curCmdType isEqualToString:@"line"]) {
 							if(mCount>1) {
-								CGPathAddLineToPoint(path, NULL, curPoint.x, curPoint.y);
+								CGPathAddLineToPoint(path, NULL, curPoint.x * scale, curPoint.y * scale);
 							} else {
-								CGPathMoveToPoint(path, NULL, curPoint.x, curPoint.y);
+								CGPathMoveToPoint(path, NULL, curPoint.x * scale, curPoint.y * scale);
 							}
 						}
 						
 						if([curCmdType isEqualToString:@"curve"])
-							CGPathAddCurveToPoint(path,NULL,curCtrlPoint1.x, curCtrlPoint1.y,
-												  curCtrlPoint2.x, curCtrlPoint2.y,
-												  curPoint.x,curPoint.y);
+							CGPathAddCurveToPoint(path,NULL,curCtrlPoint1.x * scale, curCtrlPoint1.y * scale,
+													  curCtrlPoint2.x * scale, curCtrlPoint2.y * scale,
+													  curPoint.x * scale,curPoint.y * scale);
 						
 						if([curCmdType isEqualToString:@"arc"]) {
 							CGPathAddArc (path, NULL,
@@ -673,7 +607,7 @@ didStartElement:(NSString *)elementName
 				} else {
 					prm_i++;
 				}
-				
+
 			}
 			
 			currentParams = nil;
@@ -682,8 +616,14 @@ didStartElement:(NSString *)elementName
 		
 		if([attrDict valueForKey:@"transform"]) {
 			[self applyTransformations:[attrDict valueForKey:@"transform"]];
-
-		} 		
+			pathTrnsfrmReset = YES;
+		} else if(pathTrnsfrmReset) {
+			CGContextConcatCTM(cgContext,CGAffineTransformInvert(transform));
+			transform = gTransform;
+			CGContextConcatCTM(cgContext,transform);
+			pathTrnsfrmReset = NO;
+		}
+		
 		// Respect the 'fill' attribute
 		// TODO: This hex parsing stuff is in a bunch of places. It should be cetralized in a function instead.
 		if([attrDict valueForKey:@"fill"]) {
@@ -702,13 +642,84 @@ didStartElement:(NSString *)elementName
 		
 		//CGContextClosePath(cgContext);
 		[self drawPath:path withStyle:[attrDict valueForKey:@"style"]];
-		CGPathRelease(path);
+	}
+	
+	// Parse Circle
+	// ------------------------------------------------------------------------
+	if ([elementName isEqualToString:@"circle"])
+	{
+		NSString *cx = [attrDict objectForKey:@"cx"];
+		NSString *cy = [attrDict objectForKey:@"cy"];
+		SVGPoint *circleCenter = [[SVGPoint alloc] initWithX:[cx floatValue] y:[cy floatValue]];
+		float r = [[attrDict objectForKey:@"r"] floatValue];
+		
+		if([attrDict valueForKey:@"fill"]) {
+			doFill = YES;
+			fillType = @"solid";
+			NSScanner *hexScanner = [NSScanner scannerWithString:
+									 [[attrDict valueForKey:@"fill"] stringByReplacingOccurrencesOfString:@"#" withString:@"0x"]];
+			[hexScanner setCharactersToBeSkipped:[NSCharacterSet symbolCharacterSet]]; 
+			unsigned int color;
+			[hexScanner scanHexInt:&color];
+			fillColor[0] = ((color & 0xFF0000) >> 16) / 255.0f;
+			fillColor[1] = ((color & 0x00FF00) >>  8) / 255.0f;
+			fillColor[2] =  (color & 0x0000FF) / 255.0f;
+			fillColor[3] = 1;
+		}
+		CGMutablePathRef path = CGPathCreateMutable();
+		circleCenter.x *= scale;
+		circleCenter.y *= scale;
+		r *= scale;
+		CGPathAddCircle(path,circleCenter,r);
+		[self drawPath:path withStyle:[attrDict valueForKey:@"style"]];
+		[circleCenter release];
+	}
+	
+	// Parse Polygon
+	// ------------------------------------------------------------------------
+	if([elementName isEqualToString:@"polygon"])
+	{
+		//Get Points
+		NSMutableArray *pointList = [[NSMutableArray alloc] init];
+		if ([attrDict valueForKey:@"points"]) {
+			
+			NSArray *tempPoints = [[attrDict objectForKey:@"points"] componentsSeparatedByString:@" "];
+			for(int i = 0;i < [tempPoints count];i++)
+			{
+				NSString *tempStr = [tempPoints objectAtIndex:i];
+				NSArray *tempPs = [tempStr componentsSeparatedByString:@","];
+				if ([tempPs count]>1)
+				{
+					SVGPoint *point = [[SVGPoint alloc] initWithX:[[tempPs objectAtIndex:0] floatValue] y:[[tempPs objectAtIndex:1] floatValue]];
+					point.x *= scale;
+					point.y *= scale;
+					[pointList addObject:point];
+				}
+			}
+		}
+		CGMutablePathRef path = CGPathCreateMutable();
+		CGPathAddPolygon(path,pointList);
+		//Get fill color
+		if([attrDict valueForKey:@"fill"]) {
+			doFill = YES;
+			fillType = @"solid";
+			NSScanner *hexScanner = [NSScanner scannerWithString:
+									 [[attrDict valueForKey:@"fill"] stringByReplacingOccurrencesOfString:@"#" withString:@"0x"]];
+			[hexScanner setCharactersToBeSkipped:[NSCharacterSet symbolCharacterSet]]; 
+			unsigned int color;
+			[hexScanner scanHexInt:&color];
+			fillColor[0] = ((color & 0xFF0000) >> 16) / 255.0f;
+			fillColor[1] = ((color & 0x00FF00) >>  8) / 255.0f;
+			fillColor[2] =  (color & 0x0000FF) / 255.0f;
+			fillColor[3] = 1;
+		}
+		[self drawPath:path withStyle:[attrDict valueForKey:@"style"]];
 	}
 	
 	
 	// Rect node
 	// -------------------------------------------------------------------------
-	else if([elementName isEqualToString:@"rect"]) {
+	if([elementName isEqualToString:@"rect"]) {
 		
 		// Ignore rects in flow regions for now
 		if(curFlowRegion)
@@ -725,11 +736,17 @@ didStartElement:(NSString *)elementName
 		if (rx==-1.0) rx = ry;
 		
 		CGMutablePathRef path = CGPathCreateMutable();
-		CGPathAddRoundRect(path, CGRectMake(xPos,yPos ,width,height), rx);
+		CGPathAddRoundRect(path, CGRectMake(xPos * scale,yPos * scale,width * scale,height * scale), rx * scale);
 		
 		if([attrDict valueForKey:@"transform"]) {
 			[self applyTransformations:[attrDict valueForKey:@"transform"]];
-		} 
+			pathTrnsfrmReset = YES;
+		} else if(pathTrnsfrmReset) {
+			CGContextConcatCTM(cgContext,CGAffineTransformInvert(transform));
+			transform = gTransform;
+			CGContextConcatCTM(cgContext,transform);
+			pathTrnsfrmReset = NO;
+		}
 		
 		// Respect the 'fill' attribute
 		// TODO: This hex parsing stuff is in a bunch of places. It should be cetralized in a function instead.
@@ -748,80 +765,13 @@ didStartElement:(NSString *)elementName
 		}
 		
 		[self drawPath:path withStyle:[attrDict valueForKey:@"style"]];
-		CGPathRelease(path);
 	}
-	
-	
-	// Polygon node
-	// -------------------------------------------------------------------------
-	else if([elementName isEqualToString:@"polygon"]) {
-		
-		// Ignore polygons in flow regions for now
-		if(curFlowRegion)
-		{
-			NSLog(@"In curFlowRegion");
-			return;
-		}
-		
-		NSCharacterSet *charset = [NSCharacterSet characterSetWithCharactersInString:@" \n"];
-		
-		// Extract the fill-rule attribute
-		NSString* fill_rule = [attrDict valueForKey:@"fill-rule"];
-		
-		
-		// Respect the 'fill' attribute
-		// TODO: This hex parsing stuff is in a bunch of places. It should be cetralized in a function instead.
-		if([attrDict valueForKey:@"fill"]) {
-			doFill = YES;
-			fillType = @"solid";
-			NSScanner *hexScanner = [NSScanner scannerWithString:
-									 [[attrDict valueForKey:@"fill"] stringByReplacingOccurrencesOfString:@"#" withString:@"0x"]];
-			[hexScanner setCharactersToBeSkipped:[NSCharacterSet symbolCharacterSet]];
-			unsigned int color;
-			[hexScanner scanHexInt:&color];
-			fillColor[0] = ((color & 0xFF0000) >> 16) / 255.0f;
-			fillColor[1] = ((color & 0x00FF00) >>  8) / 255.0f;
-			fillColor[2] =  (color & 0x0000FF) / 255.0f;
-			fillColor[3] = 1;
-		}
-		
-		// Extract the points attribute and parse into a CGMutablePath
-		CGMutablePathRef path = CGPathCreateMutable();
-		BOOL firstPoint = YES;
-		NSString *pointsString = [attrDict valueForKey:@"points"];
-		NSArray *pointPairs = [pointsString componentsSeparatedByCharactersInSet:charset];
-		for (NSString* pointPair in pointPairs)
-		{
-			if ([pointPair length] > 0)
-			{
-				NSArray *pointString = [pointPair componentsSeparatedByString:@","];
-				float x = [[pointString objectAtIndex:0] floatValue];
-				float y = [[pointString objectAtIndex:1] floatValue];
-				//NSLog(@"Polygon point: (%f, %f)", x, y);
-				
-				if (firstPoint)
-				{
-					firstPoint = NO;
-					CGPathMoveToPoint(path, NULL, x, y);
-				}
-				else
-				{
-					CGPathAddLineToPoint(path, NULL, x, y);
-				}
-			}
-		}
-		[self drawPath:path withStyle:[attrDict valueForKey:@"style"]];
-		CGPathRelease(path);
-		
-	}
-	
-	
 	
 	// Image node
 	// Parse the image node only if it contains an xlink:href attribute with base64 data
 	// -------------------------------------------------------------------------
-	else if([elementName isEqualToString:@"image"]
-	   && [[attrDict valueForKey:@"xlink:href"] rangeOfString:@"base64"].location != NSNotFound) {
+	if([elementName isEqualToString:@"image"]
+	&& [[attrDict valueForKey:@"xlink:href"] rangeOfString:@"base64"].location != NSNotFound) {
 		
 		if(inDefSection)
 			return;
@@ -831,23 +781,29 @@ didStartElement:(NSString *)elementName
 		float width = [[attrDict valueForKey:@"width"] floatValue];
 		float height = [[attrDict valueForKey:@"height"] floatValue];
 		
-	
+		pathTrnsfrmReset = YES;
 		if([attrDict valueForKey:@"transform"]) {
 			[self applyTransformations:[attrDict valueForKey:@"transform"]];
-		} 
+			pathTrnsfrmReset = YES;
+		} else if(pathTrnsfrmReset) {
+			CGContextConcatCTM(cgContext,CGAffineTransformInvert(transform));
+			transform = gTransform;
+			CGContextConcatCTM(cgContext,transform);
+			pathTrnsfrmReset = NO;
+		}
 		
 		yPos-=height/2;
 		CGImageRef theImage = imageFromBase64([attrDict valueForKey:@"xlink:href"]);
-		CGAffineTransform flipVertical = CGAffineTransformMake(1, 0, 0, -1, 0, height);
+		CGAffineTransform flipVertical = CGAffineTransformMake(1, 0, 0, -1, 0, height*scale);
 		CGContextConcatCTM(cgContext, flipVertical);
-		CGContextDrawImage(cgContext, CGRectMake(xPos, yPos, width, height), theImage);
+		CGContextDrawImage(cgContext, CGRectMake(xPos*scale, yPos*scale, width*scale, height*scale), theImage);
 		CGContextConcatCTM(cgContext, CGAffineTransformInvert(flipVertical));
 		CGImageRelease(theImage);
 	}
 	
 	// Text node
 	// -------------------------------------------------------------------------
-	else if([elementName isEqualToString:@"text"]) {
+	if([elementName isEqualToString:@"text"]) {
 		
 		if(inDefSection)
 			return;
@@ -859,36 +815,44 @@ didStartElement:(NSString *)elementName
 		// be centralized
 		if([attrDict valueForKey:@"transform"]) {
 			[self applyTransformations:[attrDict valueForKey:@"transform"]];
-		} 
+			pathTrnsfrmReset = YES;
+		} else if(pathTrnsfrmReset) {
+			CGContextConcatCTM(cgContext,CGAffineTransformInvert(transform));
+			transform = gTransform;
+			CGContextConcatCTM(cgContext,transform);
+			pathTrnsfrmReset = NO;
+		}
 		
-		curText = [[[NSDictionary alloc] initWithObjectsAndKeys:
-					[attrDict valueForKey:@"id"], @"id",
-					[attrDict valueForKey:@"style"], @"style",
-					[attrDict valueForKey:@"x"], @"x",
-					[attrDict valueForKey:@"y"], @"y",
-					[attrDict valueForKey:@"width"], @"width",
-					[attrDict valueForKey:@"height"], @"height",
-					nil] retain];
+		curText = [[NSDictionary dictionaryWithObjectsAndKeys:
+				   [attrDict valueForKey:@"id"], @"id",
+				   [attrDict valueForKey:@"style"], @"style",
+				   [attrDict valueForKey:@"x"], @"x",
+				   [attrDict valueForKey:@"y"], @"y",
+				   [attrDict valueForKey:@"width"], @"width",
+				   [attrDict valueForKey:@"height"], @"height",
+				   nil] retain];
 		
 		[self setStyleContext:[attrDict valueForKey:@"style"]];
 	}
 	
-	// TSpan node
-	// Assumed to always be a child of a Text node
-	// ---------------------------------------------------------------------
-	else if([elementName isEqualToString:@"tspan"]) {
-		
-		if(inDefSection)
-			return;
-		
-		[self setStyleContext:[attrDict valueForKey:@"style"]];
-	}
+		// TSpan node
+		// Assumed to always be a child of a Text node
+		// ---------------------------------------------------------------------
+		if([elementName isEqualToString:@"tspan"]) {
+			
+			if(inDefSection)
+				return;
+			
+			[self setStyleContext:[attrDict valueForKey:@"style"]];
+		}
 	
 	// FlowRegion node
 	// -------------------------------------------------------------------------
-	else if([elementName isEqualToString:@"flowRegion"]) {
-		[curFlowRegion release];		
-		curFlowRegion = [NSDictionary new];
+	if([elementName isEqualToString:@"flowRegion"]) {
+		if(curFlowRegion)
+			[curFlowRegion release];
+		
+		curFlowRegion = [[NSDictionary dictionary] retain];
 	}
 	
 	[pool release];
@@ -905,8 +869,8 @@ didStartElement:(NSString *)elementName
 		
 		CGContextSetRGBFillColor(cgContext, fillColor[0], fillColor[1], fillColor[2], fillColor[3]);
 		
-		CGContextSelectFont(cgContext, [font UTF8String], fontSize, kCGEncodingMacRoman);
-		CGContextSetFontSize(cgContext, fontSize);
+		CGContextSelectFont(cgContext, [font UTF8String], fontSize*scale, kCGEncodingMacRoman);
+		CGContextSetFontSize(cgContext, fontSize*scale);
 		CGContextSetTextMatrix(cgContext, CGAffineTransformMakeScale(1.0, -1.0));
 		
 		// TODO: Messy! Centralize.
@@ -919,19 +883,21 @@ didStartElement:(NSString *)elementName
 		CGContextSetLineJoin(cgContext, lineJoinStyle);
 		CGContextSetMiterLimit(cgContext, miterLimit);
 		
+		CGTextDrawingMode drawingMode;
 		
-		CGTextDrawingMode drawingMode = kCGTextInvisible;			
+		if(doFill)
+			drawingMode = kCGTextFill;
+		
+		if(doStroke)
+			drawingMode = kCGTextStroke;
+		
 		if(doStroke && doFill)
 			drawingMode = kCGTextFillStroke;
-		else if(doFill)
-			drawingMode = kCGTextFill;				
-		else if(doStroke)
-			drawingMode = kCGTextStroke;
 		
 		CGContextSetTextDrawingMode(cgContext, drawingMode);
 		CGContextShowTextAtPoint(cgContext,
-								 [[curText valueForKey:@"x"] floatValue],
-								 [[curText valueForKey:@"y"] floatValue],
+								 [[curText valueForKey:@"x"] floatValue]*scale,
+								 [[curText valueForKey:@"y"] floatValue]*scale,
 								 [chars UTF8String],
 								 [chars length]);
 	}
@@ -947,45 +913,45 @@ didStartElement:(NSString *)elementName
  qualifiedName:(NSString *)qName
 {
 	if([elementName isEqualToString:@"svg"]) {
-		delegate?[delegate svgRenderer:self finishedRenderingInCGContext:cgContext]:nil;
+		delegate?[delegate svgRenderer:self didFinnishRenderingFile:svgFileName inCGContext:cgContext]:nil;
 		[self cleanupAfterFinishedParsing];
 	}
 	
-	else if([elementName isEqualToString:@"g"]) {
+	if([elementName isEqualToString:@"g"]) {
 	}
 	
-	else if([elementName isEqualToString:@"defs"]) {
+	if([elementName isEqualToString:@"defs"]) {
 		inDefSection = NO;
 	}
 
-	else if([elementName isEqualToString:@"path"]) {
+	if([elementName isEqualToString:@"path"]) {
 	}
 	
-	else if([elementName isEqualToString:@"text"]) {
+	if([elementName isEqualToString:@"text"]) {
 		if(curText) {
 			[curText release];
 			curText = nil;
 		}
 	}
 	
-	else if([elementName isEqualToString:@"flowRegion"]) {
+	if([elementName isEqualToString:@"flowRegion"]) {
 		if(curFlowRegion) {
 			[curFlowRegion release];
 			curFlowRegion = nil;
 		}
 	}
 	
-	else if([elementName isEqualToString:@"pattern"]) {
+	if([elementName isEqualToString:@"pattern"]) {
 		if([curPat objectForKey:@"id"])
 		[defDict setObject:curPat forKey:[curPat objectForKey:@"id"]];
 	}
 	
-	else if([elementName isEqualToString:@"linearGradient"]) {
+	if([elementName isEqualToString:@"linearGradient"]) {
 		if([curGradient objectForKey:@"id"])
 		[defDict setObject:curGradient forKey:[curGradient objectForKey:@"id"]];
 	}
 	
-	else if([elementName isEqualToString:@"radialGradient"]) {
+	if([elementName isEqualToString:@"radialGradient"]) {
 		if([curGradient objectForKey:@"id"])
 		[defDict setObject:curGradient forKey:[curGradient objectForKey:@"id"]];
 	}
@@ -997,10 +963,9 @@ didStartElement:(NSString *)elementName
 - (void)drawPath:(CGMutablePathRef)path withStyle:(NSString *)style
 {		
 	CGContextSaveGState(cgContext);
+	
 	if(style)
 		[self setStyleContext:style];
-	
-
 	
 	if(doFill) {
 		if ([fillType isEqualToString:@"solid"]) {
@@ -1014,7 +979,7 @@ didStartElement:(NSString *)elementName
 			CGContextSetFillColorSpace(cgContext, myColorSpace);
 			CGColorSpaceRelease(myColorSpace);
 			
-			CGFloat alpha = fillColor[3];
+			double alpha = fillColor[3];
 			CGContextSetFillPattern (cgContext,
 									 fillPattern,
 									 &alpha);
@@ -1133,7 +1098,6 @@ didStartElement:(NSString *)elementName
 											   [[[[def objectForKey:@"images"] objectAtIndex:0] objectForKey:@"height"] floatValue]);
 						CGPatternCallbacks callbacks = { 0, &drawImagePattern, NULL };
 						
-						CGPatternRelease(fillPattern);
 						fillPattern = CGPatternCreate (
 											/* info */		&desc,
 											/* bounds */	desc.rect,
@@ -1149,13 +1113,13 @@ didStartElement:(NSString *)elementName
 						// Load gradient
 						fillType = [def objectForKey:@"type"];
 						if([def objectForKey:@"x1"]) {
-							fillGradientPoints[0] = CGPointMake([[def objectForKey:@"x1"] floatValue] ,[[def objectForKey:@"y1"] floatValue] );
-							fillGradientPoints[1] = CGPointMake([[def objectForKey:@"x2"] floatValue] ,[[def objectForKey:@"y2"] floatValue] );
+							fillGradientPoints[0] = CGPointMake([[def objectForKey:@"x1"] floatValue] * scale,[[def objectForKey:@"y1"] floatValue] * scale);
+							fillGradientPoints[1] = CGPointMake([[def objectForKey:@"x2"] floatValue] * scale,[[def objectForKey:@"y2"] floatValue] * scale);
 							//fillGradientAngle = (((atan2(([[def objectForKey:@"x1"] floatValue] - [[def objectForKey:@"x2"] floatValue]),
 							//											([[def objectForKey:@"y1"] floatValue] - [[def objectForKey:@"y2"] floatValue])))*180)/M_PI)+90;
 						} if([def objectForKey:@"cx"]) {
-							fillGradientCenterPoint.x = [[def objectForKey:@"cx"] floatValue] ;
-							fillGradientCenterPoint.y = [[def objectForKey:@"cy"] floatValue] ;
+							fillGradientCenterPoint.x = [[def objectForKey:@"cx"] floatValue] * scale;
+							fillGradientCenterPoint.y = [[def objectForKey:@"cy"] floatValue] * scale;
 						}
 						
 						NSArray *stops = [def objectForKey:@"stops"];
@@ -1195,8 +1159,6 @@ didStartElement:(NSString *)elementName
 							locations[i] = [[[stops objectAtIndex:i] objectForKey:@"offset"] floatValue];
 						}
 						
-			
-						CGGradientRelease(fillGradient);
 						fillGradient = CGGradientCreateWithColorComponents(CGColorSpaceCreateDeviceRGB(),
 																		   colors, 
 																		   locations,
@@ -1212,9 +1174,7 @@ didStartElement:(NSString *)elementName
 		// --------------------- FILL-OPACITY
 		if([attrName isEqualToString:@"fill-opacity"]) {
 			NSScanner *floatScanner = [NSScanner scannerWithString:attrValue];
-			float temp;
-			[floatScanner scanFloat:&temp];
-			fillColor[3] = temp;
+			[floatScanner scanFloat:&fillColor[3]];
 		}
 		
 		// --------------------- STROKE
@@ -1225,7 +1185,7 @@ didStartElement:(NSString *)elementName
 										 [attrValue stringByReplacingOccurrencesOfString:@"#" withString:@"0x"]];
 				[hexScanner setCharactersToBeSkipped:[NSCharacterSet symbolCharacterSet]]; 
 				[hexScanner scanHexInt:&strokeColor];
-				strokeWidth = 1;
+				strokeWidth = 1 * scale;
 			} else {
 				doStroke = NO;
 			}
@@ -1243,7 +1203,7 @@ didStartElement:(NSString *)elementName
 			NSScanner *floatScanner = [NSScanner scannerWithString:
 									   [attrValue stringByReplacingOccurrencesOfString:@"px" withString:@""]];
 			[floatScanner scanFloat:&strokeWidth];
-		
+			strokeWidth *= scale;
 		}
 		
 		// --------------------- STROKE-LINECAP
@@ -1327,131 +1287,60 @@ didStartElement:(NSString *)elementName
 	[pool release];
 }
 
-
 - (void)applyTransformations:(NSString *)transformations
 {
-	
 	CGContextConcatCTM(cgContext,CGAffineTransformInvert(transform));
 	
 	// Reset transformation matrix
-	transform = CGAffineTransformIdentity;
+	//transform = CGAffineTransformIdentity;
+	transform = gTransform;
 	
 	NSScanner *scanner = [NSScanner scannerWithString:transformations];
 	[scanner setCaseSensitive:YES];
 	[scanner setCharactersToBeSkipped:[NSCharacterSet newlineCharacterSet]];
 	
 	NSString *value;
-	NSArray *values;
-	float sx = scaleX, sy = scaleY;
-	
-	// Matrix
-	BOOL hasMatrix = [scanner scanString:@"matrix(" intoString:nil];
-	if (hasMatrix)
-	{
-		[scanner scanUpToString:@")" intoString:&value];
-		
-		values = [value componentsSeparatedByString:@","];
-		
-		if([values count] == 6) {
-			float a = [[values objectAtIndex:0] floatValue];
-			float b = [[values objectAtIndex:1] floatValue];
-			float c = [[values objectAtIndex:2] floatValue];
-			float d = [[values objectAtIndex:3] floatValue];
-			
-	
-			// local translation, with correction for global scale		
-			float tx = [[values objectAtIndex:4] floatValue]*sx;
-			float ty = [[values objectAtIndex:5] floatValue]*sy;
-
-			//move all scaling into separate transformation
-			float scl = sqrtf(a*d - b*c);  //!!!!!!!  assume local x scale = local y scale
-			a /= scl;
-			d /= scl;
-			if (sx != 1.0 || sy != 1.0)
-				transform = CGAffineTransformScale(transform, sx*scl, sy*scl);
-			
-			//global rotation
-			if (rotation != 0)
-				transform = CGAffineTransformRotate(transform, rotation);
-			
-			
-			CGAffineTransform matrixTransform = CGAffineTransformMake (a,b,c,d, tx - offsetX, ty - offsetY);
-
-			transform = CGAffineTransformConcat(transform, matrixTransform);
-			
-			// Apply to graphics context
-			CGContextConcatCTM(cgContext,transform);
-						
-			return;
-			
-		}
-		
-	}
-	
-	
-	// Scale
-	BOOL hasScale = [scanner scanString:@"scale(" intoString:nil];
-	if (hasScale)
-	{
-			
-		[scanner scanUpToString:@")" intoString:&value];
-		
-		values = [value componentsSeparatedByString:@","];
-
-		if([values count] == 2)
-		{
-			sx *= 	[[values objectAtIndex:0] floatValue];
-			sy *=  [[values objectAtIndex:1] floatValue];		
-		}
-
-	}
-	if (sx != 1.0 || sy != 1.0)
-		transform = CGAffineTransformScale(transform, sx, sy);
-	
-	
-	// Rotate
-	float currentRotation = rotation;
-	BOOL hasRotate = [scanner scanString:@"rotate(" intoString:nil];
-	if (hasRotate)
-	{
-		[scanner scanUpToString:@")" intoString:&value];
-		
-		if(value)
-			currentRotation += [value floatValue];
-		
-	}
-	
-	if (currentRotation != 0)
-		transform = CGAffineTransformRotate(transform, currentRotation);
-	
-
 	
 	// Translate
-	float transX = -offsetX/sx;
-	float transY = -offsetY/sy;
+	[scanner scanString:@"translate(" intoString:nil];
+	[scanner scanUpToString:@")" intoString:&value];
 	
-	BOOL hasTrans = [scanner scanString:@"translate(" intoString:nil];
-	if (hasTrans)
-	{
-		
-		[scanner scanUpToString:@")" intoString:&value];
-		
-		values = [value componentsSeparatedByString:@","];
-		
-		
-		if([values count] == 2)
-		{
-			transX += 	[[values objectAtIndex:0] floatValue] ;
-			transY += [[values objectAtIndex:1] floatValue];			
-			
-		}
-		
+	NSArray *values = [value componentsSeparatedByString:@","];
+	
+	if([values count] == 2)
+		transform = CGAffineTransformTranslate (transform,
+									[[values objectAtIndex:0] floatValue] * scale,
+									[[values objectAtIndex:1] floatValue] * scale);
+	
+	// Rotate
+	value = [NSString string];
+	scanner = [NSScanner scannerWithString:transformations];
+	[scanner scanString:@"rotate(" intoString:nil];
+	[scanner scanUpToString:@")" intoString:&value];
+	
+	if(value)
+		transform = CGAffineTransformRotate(transform, [value floatValue]);
+	
+	// Matrix
+	value = [NSString string];
+	scanner = [NSScanner scannerWithString:transformations];
+	[scanner scanString:@"matrix(" intoString:nil];
+	[scanner scanUpToString:@")" intoString:&value];
+	
+	values = [value componentsSeparatedByString:@","];
+	
+	if([values count] == 6) {
+		CGAffineTransform matrixTransform = CGAffineTransformMake ([[values objectAtIndex:0] floatValue],
+																   [[values objectAtIndex:1] floatValue],
+																   [[values objectAtIndex:2] floatValue],
+																   [[values objectAtIndex:3] floatValue],
+																   [[values objectAtIndex:4] floatValue],
+																   [[values objectAtIndex:5] floatValue]);
+		transform = CGAffineTransformConcat(transform, matrixTransform);
 	}
 	
-	if (transX != 0 || transY != 0)
-		transform = CGAffineTransformTranslate(transform, transX, transY);			
-
 	// Apply to graphics context
+	//CGContextConcatCTM(cgContext,gTransform);
 	CGContextConcatCTM(cgContext,transform);
 }
 
@@ -1476,7 +1365,6 @@ didStartElement:(NSString *)elementName
 	return def;
 }
 
-
 - (CGContextRef)createBitmapContext
 {
 	CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
@@ -1487,10 +1375,10 @@ didStartElement:(NSString *)elementName
 
 void drawImagePattern(void * fillPatDescriptor, CGContextRef context)
 {
-	FillPatternDescriptor *patDesc = (FillPatternDescriptor *)fillPatDescriptor;
+	FillPatternDescriptor *patDesc;
+	patDesc = (FillPatternDescriptor *)fillPatDescriptor;
 	CGContextDrawImage(context, patDesc->rect, patDesc->imgRef);
 	CGImageRelease(patDesc->imgRef);
-	patDesc->imgRef = NULL;
 }
 
 CGImageRef imageFromBase64(NSString *b64Data)
@@ -1506,6 +1394,28 @@ CGImageRef imageFromBase64(NSString *b64Data)
 		img = CGImageCreateWithPNGDataProvider(provider, NULL, true, kCGRenderingIntentDefault);
 	CGDataProviderRelease(provider);
 	return img;
+}
+
+void CGPathAddCircle(CGMutablePathRef path,SVGPoint *center,float r)
+{
+	CGRect bounds = CGRectMake(center.x - r, center.y - r, 2*r , 2*r);
+	CGPathAddEllipseInRect(path, NULL, bounds);
+}
+
+void CGPathAddPolygon(CGMutablePathRef path,NSMutableArray *polygonPoints)
+{
+	for(int i = 0;i < [polygonPoints count];i++)
+	{
+		SVGPoint *point = [polygonPoints objectAtIndex:i];
+		//Draw the point
+		if (i == 0)
+		{
+			CGPathMoveToPoint(path,NULL, point.x, point.y);
+		}
+		else {
+			CGPathAddLineToPoint(path,NULL, point.x, point.y);
+		}
+	}
 }
 
 void CGPathAddRoundRect(CGMutablePathRef path, CGRect rect, float radius)
@@ -1534,6 +1444,7 @@ void CGPathAddRoundRect(CGMutablePathRef path, CGRect rect, float radius)
 {
 	[self cleanupAfterFinishedParsing];
 	[xmlParser release];
+	
 	[super dealloc];
 }
 
@@ -1551,14 +1462,9 @@ void CGPathAddRoundRect(CGMutablePathRef path, CGRect rect, float radius)
 	curText = nil;
 	[font release];
 	font = nil;
-	CGContextRelease(cgContext);
-	cgContext = NULL;
-	CGGradientRelease(fillGradient);
-	fillGradient = NULL;
-	[curFlowRegion release];
-	curFlowRegion = nil;
-	CGPatternRelease(fillPattern);
-	fillPattern = NULL;
+	if(cgContext)
+		CGContextRelease(cgContext);
+	cgContext = nil;
 	
 }
 
