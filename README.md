@@ -18,6 +18,8 @@ SVGQuartzRenderer is currently quite far from conforming to any SVG Profile at a
 * Fill and stroke
 * Gradient fills
 * Pattern fills (Note: transformation of pattern fills is not yet implemented)
+* Polygon
+* Circle
 
 Notable features that are NOT yet supported:
 
