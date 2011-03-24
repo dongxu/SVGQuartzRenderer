@@ -22,6 +22,17 @@
 
 #import <Foundation/Foundation.h>
 
+@interface SVGPoint : NSObject {
+	float x;
+	float y;
+}
+
+@property (assign) float x;
+@property (assign) float y;
+
+- (id)initWithX:(float)out_x y:(float)out_y;
+@end
+
 @protocol SVGQuartzRenderDelegate
 
 	- (void)svgRenderer:(id)renderer
