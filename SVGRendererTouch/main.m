@@ -2,9 +2,6 @@
 //  main.m
 //  SVGRendererTouch
 //
-//  Created by Aaron Boxer on 10-10-15.
-//  Copyright 2010 __MyCompanyName__. All rights reserved.
-//
 
 #import <UIKit/UIKit.h>
 
